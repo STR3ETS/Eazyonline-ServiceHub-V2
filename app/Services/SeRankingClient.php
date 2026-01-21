@@ -347,4 +347,82 @@ class SeRankingClient
             'offset'   => $offset,
         ]);
     }
+
+    public function listSystemSearchEngines(): array
+    {
+        // Project API: GET /system/search-engines
+        return $this->requestProject('get', '/system/search-engines');
+    }
+
+    public function addProjectSearchEngine(int $siteId, int $searchEngineId, array $options = []): array
+    {
+        // Project API: POST /sites/{site_id}/search-engines
+        // search_engine_id is verplicht. Region/lang zijn optioneel.
+        $payload = array_merge([
+            'search_engine_id' => $searchEngineId,
+        ], $options);
+
+        return $this->requestProject('post', "/sites/{$siteId}/search-engines", $payload);
+    }
+
+    /**
+     * Zorgt dat het project minimaal 1 search engine heeft: Google Netherlands.
+     * Geeft de project site_engine_id terug (die je nodig hebt voor /positions).
+     */
+    public function ensureGoogleNetherlandsEngine(int $siteId): ?int
+    {
+        // 1) Als er al engines zijn: pak de eerste site_engine_id
+        $existing = $this->getProjectSearchEngines($siteId);
+        if (is_array($existing) && count($existing) > 0) {
+            $first = $existing[0] ?? [];
+            $siteEngineId = (int) ($first['site_engine_id'] ?? 0);
+            return $siteEngineId > 0 ? $siteEngineId : null;
+        }
+
+        // 2) Zoek "Google Netherlands" in /system/search-engines
+        $engines = $this->listSystemSearchEngines();
+        $engines = is_array($engines) ? $engines : [];
+
+        $match = null;
+        foreach ($engines as $e) {
+            $name = strtolower((string) ($e['name'] ?? ''));
+            if ($name === 'google netherlands') {
+                $match = $e;
+                break;
+            }
+        }
+
+        // fallback: soms heet hij net iets anders (bv "Google Netherlands (nl)")
+        if (!$match) {
+            foreach ($engines as $e) {
+                $name = strtolower((string) ($e['name'] ?? ''));
+                if (str_contains($name, 'google') && str_contains($name, 'netherlands')) {
+                    $match = $e;
+                    break;
+                }
+            }
+        }
+
+        $searchEngineId = (int) ($match['id'] ?? 0);
+        if ($searchEngineId <= 0) {
+            return null;
+        }
+
+        // region_id komt vaak mee in de lijst (soms als regionid)
+        $regionId = (int) ($match['region_id'] ?? ($match['regionid'] ?? 0));
+
+        // 3) Voeg toe aan project
+        $res = $this->addProjectSearchEngine($siteId, $searchEngineId, [
+            'region_id' => $regionId,  // mag 0 zijn, maar NL item heeft meestal een region id
+            'lang_code' => 'nl',       // optioneel, maar logisch voor NL
+            'merge_map' => 0,
+            'paid_results' => 0,
+            'featured_snippet' => 0,
+        ]);
+
+        // docs: succesvolle response bevat site_engine_id :contentReference[oaicite:3]{index=3}
+        $siteEngineId = (int) ($res['site_engine_id'] ?? 0);
+        return $siteEngineId > 0 ? $siteEngineId : null;
+    }
+
 }

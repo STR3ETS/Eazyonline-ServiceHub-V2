@@ -2,10 +2,11 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\RunSeoAuditJob;
 use App\Models\Company;
 use App\Models\SeoAudit;
 use App\Models\SeoProject;
-use App\Jobs\RunSeoAuditJob;
+use App\Services\SeoAiClient;
 use App\Services\SeRankingClient;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Request;
@@ -20,9 +21,9 @@ class SeoProjectController extends Controller
             ->orderBy('created_at', 'desc')
             ->get();
 
-        $totalProjects      = $projects->count();
-        $needingAttention   = $projects->where('health_overall', '<', 70)->count();
-        $withoutSync        = $projects->whereNull('last_synced_at')->count();
+        $totalProjects    = $projects->count();
+        $needingAttention = $projects->where('health_overall', '<', 70)->count();
+        $withoutSync      = $projects->whereNull('last_synced_at')->count();
 
         return view('hub.seo.projects.index', [
             'user'             => $user,
@@ -55,16 +56,27 @@ class SeoProjectController extends Controller
 
         $project = SeoProject::create($data);
 
-        // Probeer direct een SE Ranking project/site aan te maken
+        // Probeer direct een SE Ranking project/site aan te maken + Google Nederland engine koppelen
         try {
             $res = $seranking->createProjectSite(
-                $project->domain,                 // -> url (https://domain)
+                $project->domain,                  // -> url (https://domain)
                 $project->name ?: $project->domain // -> title
             );
 
             $siteId = (int) ($res['id'] ?? 0);
 
             if ($siteId > 0) {
+                // Zorg dat Google Netherlands direct gekoppeld is, zodat positions niet faalt
+                try {
+                    $seranking->ensureGoogleNetherlandsEngine($siteId);
+                } catch (\Throwable $e) {
+                    logger()->warning('SERanking ensureGoogleNetherlandsEngine failed in store()', [
+                        'seo_project_id' => $project->id,
+                        'site_id' => $siteId,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+
                 $project->update([
                     'seranking_project_id' => (string) $siteId,
                     'last_synced_at' => null,
@@ -112,41 +124,44 @@ class SeoProjectController extends Controller
         $siteId = $project->seranking_project_id ? (int) $project->seranking_project_id : null;
 
         $stat = null;
-        $siteEngineId = (int) config('seranking.default_site_engine_id', 1);
         $keywords = [];
         $keywordRows = [];
+        $siteEngineId = null;
+
+        $serankingNeedsSearchEngine = false;
 
         if ($siteId) {
             try {
-                $engines = $seranking->getProjectSearchEngines($siteId);
-                if (is_array($engines) && count($engines) > 0) {
-                    $first = $engines[0] ?? [];
-                    $siteEngineId = (int) ($first['site_engine_id'] ?? $siteEngineId);
+                // Zorg dat er een engine is, en pak de juiste site_engine_id (geen hardcoded 1)
+                $siteEngineId = $seranking->ensureGoogleNetherlandsEngine($siteId);
+
+                if (!$siteEngineId || (int) $siteEngineId <= 0) {
+                    $serankingNeedsSearchEngine = true;
+                } else {
+                    $stat = $seranking->getProjectStat($siteId);
+
+                    $project->update([
+                        'visibility_index' => isset($stat['visibility_percent']) ? (float) $stat['visibility_percent'] : $project->visibility_index,
+                        'organic_traffic'  => isset($stat['visibility']) ? (int) $stat['visibility'] : $project->organic_traffic,
+                        'last_synced_at'   => now(),
+                    ]);
+
+                    $keywords = $seranking->getProjectKeywords($siteId, (int) $siteEngineId);
+
+                    $dateFrom = now()->subDays(30)->toDateString();
+                    $dateTo   = now()->toDateString();
+
+                    $positions = $seranking->getPositions(
+                        $siteId,
+                        $dateFrom,
+                        $dateTo,
+                        (int) $siteEngineId,
+                        true,
+                        false
+                    );
+
+                    $keywordRows = $this->mapPositionsToRows($positions);
                 }
-
-                $stat = $seranking->getProjectStat($siteId);
-
-                $project->update([
-                    'visibility_index' => isset($stat['visibility_percent']) ? (float) $stat['visibility_percent'] : $project->visibility_index,
-                    'organic_traffic'  => isset($stat['visibility']) ? (int) $stat['visibility'] : $project->organic_traffic,
-                    'last_synced_at'   => now(),
-                ]);
-
-                $keywords = $seranking->getProjectKeywords($siteId, $siteEngineId);
-
-                $dateFrom = now()->subDays(30)->toDateString();
-                $dateTo   = now()->toDateString();
-
-                $positions = $seranking->getPositions(
-                    $siteId,
-                    $dateFrom,
-                    $dateTo,
-                    $siteEngineId,
-                    true,
-                    false
-                );
-
-                $keywordRows = $this->mapPositionsToRows($positions);
             } catch (\Throwable $e) {
                 logger()->warning('SEO project show: SERanking fetch failed', [
                     'seo_project_id' => $project->id,
@@ -158,6 +173,9 @@ class SeoProjectController extends Controller
 
         return view('hub.seo.projects.show', [
             'user'        => $user,
+
+            // geef beide door, dan kan je Blade nooit meer "Undefined variable $seoProject" krijgen
+            'seoProject'  => $seoProject,
             'project'     => $project,
 
             'serankingSites' => $sites,
@@ -167,6 +185,9 @@ class SeoProjectController extends Controller
             'serankingKeywords' => $keywords,
             'serankingKeywordRows' => $keywordRows,
             'serankingSiteEngineId' => $siteEngineId,
+
+            // Nieuw: gebruik dit in je Blade om een nette melding te tonen indien nodig
+            'serankingNeedsSearchEngine' => $serankingNeedsSearchEngine,
         ]);
     }
 
@@ -223,6 +244,12 @@ class SeoProjectController extends Controller
         $siteId = (int) $seoProject->seranking_project_id;
 
         try {
+            // Zorg dat de engine ok is (anders weet je waarom het "niet werkt")
+            $siteEngineId = $seranking->ensureGoogleNetherlandsEngine($siteId);
+            if (!$siteEngineId || (int) $siteEngineId <= 0) {
+                return back()->with('status', 'Zoekmachine ontbreekt in SE Ranking. Voeg Google Nederland toe en probeer opnieuw.');
+            }
+
             $stat = $seranking->getProjectStat($siteId);
 
             $seoProject->update([
@@ -389,6 +416,91 @@ class SeoProjectController extends Controller
             $msg = $this->friendlySerankingError($e, 'Recheck starten is mislukt.');
             return back()->with('status', $msg);
         }
+    }
+
+    /**
+     * MCP chat: bewaart thread in session per project.
+     * Verwacht POST: message, mode (optioneel: chat|keyword_plan)
+     */
+    public function mcpChat(Request $request, SeoProject $seoProject, SeoAiClient $ai)
+    {
+        $request->validate([
+            'message' => ['required', 'string', 'min:2'],
+            'mode'    => ['nullable', 'string'],
+        ]);
+
+        $mode = (string) $request->input('mode', 'chat');
+        $message = trim((string) $request->input('message'));
+
+        $threadKey = 'seo_mcp_thread_' . $seoProject->id;
+        $thread = session($threadKey, []);
+        $thread = is_array($thread) ? $thread : [];
+
+        // user message
+        $thread[] = ['role' => 'user', 'content' => $message];
+
+        // Developer instructions (jouw "SEO assistent")
+        $domain = $seoProject->domain ?: '';
+        $baseInstructions = "Je bent een Nederlandse SEO assistent voor een interne dashboard tool. Antwoord kort, concreet en bruikbaar.";
+        $context = $domain !== '' ? "Domein: {$domain}." : "";
+
+        $modeInstructions = match ($mode) {
+            'keyword_plan' => "Geef exact 25 keywords voor {$domain}. Zet per keyword: intentie (koop, info, lokaal), volume-inschatting (laag/middel/hoog), en prioriteit (hoog/middel/laag). Geef het als markdown tabel met kolommen: Keyword | Intentie | Volume | Prioriteit. Geen extra tekst.",
+            default => "Help met SEO vragen voor {$domain}. Als je een lijst geeft: gebruik bullets. Als je stappen geeft: genummerd. Geen vaagheden.",
+        };
+
+        $messages = [];
+        $messages[] = [
+            'role' => 'developer',
+            'content' => trim($baseInstructions . " " . $context . " " . $modeInstructions),
+        ];
+
+        // Voeg thread toe als context (laatste 20 berichten is genoeg)
+        $last = array_slice($thread, -20);
+        foreach ($last as $m) {
+            $role = ($m['role'] ?? 'user') === 'assistant' ? 'assistant' : 'user';
+            $content = (string) ($m['content'] ?? '');
+            if ($content === '') continue;
+
+            $messages[] = [
+                'role' => $role,
+                'content' => $content,
+            ];
+        }
+
+        try {
+            $reply = $ai->reply($messages, [
+                'model' => env('OPENAI_MODEL', 'gpt-5.2'),
+                'reasoning_effort' => 'low',
+            ]);
+        } catch (\Throwable $e) {
+            logger()->warning('SEO AI chat failed', [
+                'seo_project_id' => $seoProject->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $reply = "AI is nog niet goed ingesteld. Check je .env: OPENAI_API_KEY en probeer opnieuw.";
+        }
+
+        $thread[] = ['role' => 'assistant', 'content' => $reply];
+
+        // cap thread (laatste 30 berichten)
+        if (count($thread) > 30) {
+            $thread = array_slice($thread, -30);
+        }
+
+        session([$threadKey => $thread]);
+
+        return back()->withInput([]);
+    }
+
+
+    public function mcpClear(SeoProject $seoProject)
+    {
+        $threadKey = 'seo_mcp_thread_' . $seoProject->id;
+        session()->forget($threadKey);
+
+        return back()->with('status', 'AI chat is gewist.');
     }
 
     public function startAudit(SeoProject $seoProject)

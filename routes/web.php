@@ -30,6 +30,7 @@ use App\Http\Controllers\AanvraagTaskController;
 use App\Http\Controllers\AanvraagWebsiteOwnerController;
 use App\Http\Controllers\AanvraagCommentController;
 use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\SeoChatKitController;
 
 // eazyonline.nl website
 Route::view('/', 'website.home')->name('pages.home');
@@ -445,15 +446,19 @@ Route::prefix('app')->group(function () {
                 Route::get('/projects/{seoProject}', 'show')->name('projects.show');
                 Route::get('/projects/{seoProject}/edit', 'edit')->name('projects.edit');
                 Route::patch('/projects/{seoProject}', 'update')->name('projects.update');
-
-                // Website audit (heb je al)
+                
                 Route::post('/projects/{seoProject}/audits', 'startAudit')->name('projects.audits.start');
 
-                // SE Ranking koppeling + data
                 Route::post('/projects/{seoProject}/seranking/connect', 'connectSeranking')->name('projects.seranking.connect');
                 Route::post('/projects/{seoProject}/seranking/sync', 'syncSeranking')->name('projects.seranking.sync');
                 Route::post('/projects/{seoProject}/seranking/keywords', 'addSerankingKeywords')->name('projects.seranking.keywords.add');
                 Route::post('/projects/{seoProject}/seranking/recheck', 'recheckSeranking')->name('projects.seranking.recheck');
+
+                // MCP (AI assistent)
+                Route::post('/projects/{seoProject}/mcp/chat', 'mcpChat')->name('projects.mcp.chat');
+                Route::post('/projects/{seoProject}/mcp/clear', 'mcpClear')->name('projects.mcp.clear');
+                Route::post('/chatkit/session', [SeoChatKitController::class, 'session'])->name('chatkit.session');
+
             });
 
         // Marketing

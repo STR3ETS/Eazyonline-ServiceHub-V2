@@ -5,7 +5,7 @@ return [
      * Project API (api4) - voor projecten, keywords, rankings, stat.
      * Let op: Project API key is anders dan Data API key.
      */
-    'project_api_key' => env('SERANKING_PROJECT_API_KEY', env('SERANKING_API_KEY')),
+    'project_api_key' => env('SERANKING_PROJECT_API_KEY'),
     'project_base_url' => env('SERANKING_PROJECT_BASE_URL', 'https://api4.seranking.com'),
 
     /**
